@@ -89,6 +89,18 @@ const authenticateUser = async (req, res, next) => {
   }
 };
 
+// Helper function to get user display info from auth.users metadata
+const getUserInfo = (user) => {
+  const metadata = user.user_metadata || {};
+  const rawMetadata = user.raw_user_meta_data || {};
+  
+  return {
+    username: metadata.username || rawMetadata.username || user.email?.split('@')[0] || 'user',
+    isVerified: metadata.is_verified || rawMetadata.is_verified || false,
+    userType: metadata.user_type || rawMetadata.user_type || 'Photography Enthusiast'
+  };
+};
+
 // Helper function to upload to Cloudinary
 const uploadToCloudinary = (buffer, options = {}) => {
   return new Promise((resolve, reject) => {
@@ -114,18 +126,21 @@ const uploadToCloudinary = (buffer, options = {}) => {
 };
 
 // Helper function to format post data
-const formatPost = (post) => {
+const formatPost = (post, userInfo = null) => {
   return {
     id: post.id,
     userId: post.user_id,
-    userName: post.user_profiles?.username || post.profiles?.username || 'unknown',
+    userName: userInfo?.username || 'unknown',
     imageUrl: post.image_url,
     caption: post.caption,
     location: post.location,
-    tags: post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [],
+    likes: post.likes || 0,
+    commentCount: post.comment_count || 0,
+    tags: post.tags || [],
     createdAt: post.created_at,
-    isVerified: post.user_profiles?.is_verified || post.profiles?.is_verified || false,
-    userType: post.user_profiles?.user_type || post.profiles?.user_type || 'Photography Enthusiast'
+    isVerified: userInfo?.isVerified || false,
+    userType: userInfo?.userType || 'Photography Enthusiast',
+    isFeatured: post.is_featured || false
   };
 };
 
@@ -147,8 +162,6 @@ app.get('/api/posts', async (req, res) => {
       .from('posts')
       .select(`
         *,
-        user_profiles (username, is_verified, user_type),
-        profiles (username, is_verified, user_type),
         post_tags (
           tags (name)
         )
@@ -170,10 +183,29 @@ app.get('/api/posts', async (req, res) => {
 
     if (error) throw error;
 
+    // Get user info for each post
+    const postsWithUserInfo = await Promise.all(
+      data.map(async (post) => {
+        try {
+          // Get user info from auth.users
+          const { data: userData } = await supabase.auth.admin.getUserById(post.user_id);
+          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
+          
+          // Format tags
+          const tags = post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
+          
+          return formatPost({ ...post, tags }, userInfo);
+        } catch (err) {
+          console.error('Error getting user info:', err);
+          return formatPost({ ...post, tags: [] });
+        }
+      })
+    );
+
     res.json({
       success: true,
       data: {
-        posts: data.map(formatPost),
+        posts: postsWithUserInfo,
         total: count,
         limit: parseInt(limit),
         offset: parseInt(offset)
@@ -194,8 +226,6 @@ app.get('/api/posts/:id', async (req, res) => {
       .from('posts')
       .select(`
         *,
-        user_profiles (username, is_verified, user_type),
-        profiles (username, is_verified, user_type),
         post_tags (
           tags (name)
         )
@@ -209,9 +239,16 @@ app.get('/api/posts/:id', async (req, res) => {
       return res.status(404).json({ error: 'Post not found' });
     }
 
+    // Get user info
+    const { data: userData } = await supabase.auth.admin.getUserById(data.user_id);
+    const userInfo = userData?.user ? getUserInfo(userData.user) : null;
+    
+    // Format tags
+    const tags = data.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
+
     res.json({
       success: true,
-      data: formatPost(data)
+      data: formatPost({ ...data, tags }, userInfo)
     });
   } catch (error) {
     console.error('Get post error:', error);
@@ -226,7 +263,7 @@ app.post('/api/posts', authenticateUser, upload.single('image'), async (req, res
       return res.status(400).json({ error: 'Image file is required' });
     }
 
-    const { caption, location, tags, userName } = req.body;
+    const { caption, location, tags } = req.body;
 
     if (!caption) {
       return res.status(400).json({ error: 'Caption is required' });
@@ -263,13 +300,14 @@ app.post('/api/posts', authenticateUser, upload.single('image'), async (req, res
     if (postError) throw postError;
 
     // Handle tags if any
+    const postTags = [];
     if (parsedTags && parsedTags.length > 0) {
       for (const tagName of parsedTags) {
         // Create tag if it doesn't exist
         const { data: tag, error: tagError } = await supabase
           .from('tags')
           .upsert({ name: tagName.toLowerCase() })
-          .select('id')
+          .select('id, name')
           .single();
 
         if (!tagError && tag) {
@@ -277,28 +315,19 @@ app.post('/api/posts', authenticateUser, upload.single('image'), async (req, res
           await supabase
             .from('post_tags')
             .insert({ post_id: post.id, tag_id: tag.id });
+          
+          postTags.push(tag.name);
         }
       }
     }
 
-    // Fetch the complete post data
-    const { data: completePost } = await supabase
-      .from('posts')
-      .select(`
-        *,
-        user_profiles (username, is_verified, user_type),
-        profiles (username, is_verified, user_type),
-        post_tags (
-          tags (name)
-        )
-      `)
-      .eq('id', post.id)
-      .single();
+    // Get user info for response
+    const userInfo = getUserInfo(req.user);
 
     res.status(201).json({
       success: true,
       message: 'Post created successfully',
-      data: formatPost(completePost)
+      data: formatPost({ ...post, tags: postTags }, userInfo)
     });
   } catch (error) {
     console.error('Create post error:', error);
@@ -331,6 +360,7 @@ app.put('/api/posts/:id', authenticateUser, async (req, res) => {
     const updateData = {};
     if (caption !== undefined) updateData.caption = caption;
     if (location !== undefined) updateData.location = location || null;
+    updateData.updated_at = new Date().toISOString();
 
     const { data: updatedPost, error: updateError } = await supabase
       .from('posts')
@@ -342,6 +372,7 @@ app.put('/api/posts/:id', authenticateUser, async (req, res) => {
     if (updateError) throw updateError;
 
     // Update tags if provided
+    const postTags = [];
     if (tags !== undefined) {
       // Remove existing tags
       await supabase.from('post_tags').delete().eq('post_id', id);
@@ -352,35 +383,34 @@ app.put('/api/posts/:id', authenticateUser, async (req, res) => {
         const { data: tag } = await supabase
           .from('tags')
           .upsert({ name: tagName.toLowerCase() })
-          .select('id')
+          .select('id, name')
           .single();
 
         if (tag) {
           await supabase
             .from('post_tags')
             .insert({ post_id: id, tag_id: tag.id });
+          
+          postTags.push(tag.name);
         }
       }
+    } else {
+      // Get existing tags
+      const { data: existingTags } = await supabase
+        .from('post_tags')
+        .select('tags(name)')
+        .eq('post_id', id);
+      
+      postTags.push(...(existingTags?.map(pt => pt.tags?.name).filter(Boolean) || []));
     }
 
-    // Fetch updated post with all details
-    const { data: completePost } = await supabase
-      .from('posts')
-      .select(`
-        *,
-        user_profiles (username, is_verified, user_type),
-        profiles (username, is_verified, user_type),
-        post_tags (
-          tags (name)
-        )
-      `)
-      .eq('id', id)
-      .single();
+    // Get user info for response
+    const userInfo = getUserInfo(req.user);
 
     res.json({
       success: true,
       message: 'Post updated successfully',
-      data: formatPost(completePost)
+      data: formatPost({ ...updatedPost, tags: postTags }, userInfo)
     });
   } catch (error) {
     console.error('Update post error:', error);
@@ -408,7 +438,7 @@ app.delete('/api/posts/:id', authenticateUser, async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    // Delete from database (CASCADE will handle post_tags)
+    // Delete from database (CASCADE will handle post_tags, likes, comments)
     const { error: deleteError } = await supabase
       .from('posts')
       .delete()
@@ -448,8 +478,6 @@ app.get('/api/posts/search', async (req, res) => {
       .from('posts')
       .select(`
         *,
-        user_profiles (username, is_verified, user_type),
-        profiles (username, is_verified, user_type),
         post_tags (
           tags (name)
         )
@@ -460,10 +488,24 @@ app.get('/api/posts/search', async (req, res) => {
 
     if (error) throw error;
 
+    // Get user info for each post
+    const postsWithUserInfo = await Promise.all(
+      data.map(async (post) => {
+        try {
+          const { data: userData } = await supabase.auth.admin.getUserById(post.user_id);
+          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
+          const tags = post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
+          return formatPost({ ...post, tags }, userInfo);
+        } catch (err) {
+          return formatPost({ ...post, tags: [] });
+        }
+      })
+    );
+
     res.json({
       success: true,
       data: {
-        posts: data.map(formatPost),
+        posts: postsWithUserInfo,
         total: count,
         limit: parseInt(limit),
         offset: parseInt(offset),
@@ -486,8 +528,6 @@ app.get('/api/posts/tag/:tagName', async (req, res) => {
       .from('posts')
       .select(`
         *,
-        user_profiles (username, is_verified, user_type),
-        profiles (username, is_verified, user_type),
         post_tags!inner (
           tags!inner (name)
         )
@@ -498,10 +538,24 @@ app.get('/api/posts/tag/:tagName', async (req, res) => {
 
     if (error) throw error;
 
+    // Get user info for each post
+    const postsWithUserInfo = await Promise.all(
+      data.map(async (post) => {
+        try {
+          const { data: userData } = await supabase.auth.admin.getUserById(post.user_id);
+          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
+          const tags = post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
+          return formatPost({ ...post, tags }, userInfo);
+        } catch (err) {
+          return formatPost({ ...post, tags: [] });
+        }
+      })
+    );
+
     res.json({
       success: true,
       data: {
-        posts: data.map(formatPost),
+        posts: postsWithUserInfo,
         total: count,
         limit: parseInt(limit),
         offset: parseInt(offset),
@@ -520,24 +574,89 @@ app.get('/api/tags', async (req, res) => {
     const { limit = 20 } = req.query;
 
     const { data, error } = await supabase
-      .from('tags')
-      .select('name, post_tags(count)')
-      .limit(parseInt(limit));
+      .rpc('get_popular_tags', { tag_limit: parseInt(limit) });
 
-    if (error) throw error;
+    if (error) {
+      // Fallback if RPC doesn't exist
+      const { data: fallbackData, error: fallbackError } = await supabase
+        .from('tags')
+        .select(`
+          name,
+          post_tags(count)
+        `)
+        .limit(parseInt(limit));
 
-    const tags = data.map(tag => ({
-      name: tag.name,
-      count: tag.post_tags?.length || 0
-    })).sort((a, b) => b.count - a.count);
+      if (fallbackError) throw fallbackError;
+
+      const tags = fallbackData.map(tag => ({
+        name: tag.name,
+        count: tag.post_tags?.length || 0
+      })).sort((a, b) => b.count - a.count);
+
+      return res.json({
+        success: true,
+        data: tags
+      });
+    }
 
     res.json({
       success: true,
-      data: tags
+      data: data || []
     });
   } catch (error) {
     console.error('Get tags error:', error);
     res.status(500).json({ error: 'Failed to fetch tags' });
+  }
+});
+
+// Like/Unlike post
+app.post('/api/posts/:id/like', authenticateUser, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if already liked
+    const { data: existingLike } = await supabase
+      .from('likes')
+      .select('id')
+      .eq('post_id', id)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (existingLike) {
+      // Unlike
+      const { error } = await supabase
+        .from('likes')
+        .delete()
+        .eq('post_id', id)
+        .eq('user_id', req.user.id);
+
+      if (error) throw error;
+
+      res.json({
+        success: true,
+        message: 'Post unliked',
+        liked: false
+      });
+    } else {
+      // Like
+      const { error } = await supabase
+        .from('likes')
+        .insert({
+          post_id: id,
+          user_id: req.user.id
+        });
+
+      if (error) throw error;
+
+      res.json({
+        success: true,
+        message: 'Post liked',
+        liked: true
+      });
+    }
+  } catch (error) {
+    console.error('Like/unlike error:', error);
+    res.status(500).json({ error: 'Failed to like/unlike post' });
   }
 });
 
