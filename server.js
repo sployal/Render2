@@ -1,131 +1,295 @@
 require('dotenv').config();
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
 const cors = require('cors');
 const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const cloudinary = require('cloudinary').v2;
+const validator = require('validator');
 
 // Initialize Express
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configure Cloudinary
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
+// Security: Configure Helmet
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https://res.cloudinary.com"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+    },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
+// Security: Rate limiting
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests from this IP, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-// Configure Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // Limit each IP to 10 uploads per hour
+  message: { error: 'Upload limit exceeded, please try again later.' },
+});
 
-// Configure Multer for file uploads
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 failed auth attempts per 15 minutes
+  skipSuccessfulRequests: true,
+  message: { error: 'Too many authentication attempts, please try again later.' },
+});
+
+// Apply rate limiting
+app.use(generalLimiter);
+
+// Configure Cloudinary with validation
+const validateCloudinaryConfig = () => {
+  const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
+  
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+    throw new Error('Missing Cloudinary configuration');
+  }
+  
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET,
+    secure: true, // Force HTTPS
+  });
+};
+
+// Configure Supabase with validation
+const validateSupabaseConfig = () => {
+  const { SUPABASE_URL, SUPABASE_ANON_KEY } = process.env;
+  
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('Missing Supabase configuration');
+  }
+  
+  if (!validator.isURL(SUPABASE_URL)) {
+    throw new Error('Invalid Supabase URL format');
+  }
+  
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      detectSessionInUrl: false
+    }
+  });
+};
+
+let supabase;
+try {
+  validateCloudinaryConfig();
+  supabase = validateSupabaseConfig();
+  console.log('✅ Configuration validated successfully');
+} catch (error) {
+  console.error('❌ Configuration error:', error.message);
+  process.exit(1);
+}
+
+// Security: Configure CORS properly
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production' 
+    ? process.env.ALLOWED_ORIGINS?.split(',') || []
+    : true, // Allow all origins in development
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false,
+  maxAge: 86400, // 24 hours
+};
+
+app.use(cors(corsOptions));
+
+// Security: Configure Multer with strict validation
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB limit
+    files: 1, // Only one file at a time
+    fieldSize: 1024 * 1024, // 1MB for text fields
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed!'), false);
+    // Strict MIME type checking
+    const allowedMimeTypes = [
+      'image/jpeg',
+      'image/jpg', 
+      'image/png',
+      'image/webp'
+    ];
+    
+    if (!allowedMimeTypes.includes(file.mimetype)) {
+      return cb(new Error('Invalid file type. Only JPEG, PNG, and WebP are allowed.'), false);
     }
+    
+    // Additional file extension validation
+    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.webp'];
+    const fileExtension = file.originalname.toLowerCase().substring(file.originalname.lastIndexOf('.'));
+    
+    if (!allowedExtensions.includes(fileExtension)) {
+      return cb(new Error('Invalid file extension.'), false);
+    }
+    
+    cb(null, true);
   },
 });
 
 // Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(compression());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Validate environment variables on startup
-const validateEnvironment = () => {
-  const required = [
-    'SUPABASE_URL',
-    'SUPABASE_ANON_KEY', 
-    'CLOUDINARY_CLOUD_NAME',
-    'CLOUDINARY_API_KEY',
-    'CLOUDINARY_API_SECRET'
-  ];
+// Security: Input validation helpers
+const validatePostInput = (data) => {
+  const errors = [];
   
-  const missing = required.filter(key => !process.env[key]);
-  
-  if (missing.length > 0) {
-    console.log('❌ Missing environment variables:', missing.join(', '));
-    return false;
+  if (!data.caption || typeof data.caption !== 'string') {
+    errors.push('Caption is required and must be a string');
+  } else if (data.caption.length > 2200) {
+    errors.push('Caption must be less than 2200 characters');
   }
   
-  return true;
+  if (data.location && (typeof data.location !== 'string' || data.location.length > 100)) {
+    errors.push('Location must be a string less than 100 characters');
+  }
+  
+  if (data.tags) {
+    if (!Array.isArray(data.tags)) {
+      errors.push('Tags must be an array');
+    } else if (data.tags.length > 10) {
+      errors.push('Maximum 10 tags allowed');
+    } else {
+      const invalidTags = data.tags.filter(tag => 
+        typeof tag !== 'string' || 
+        tag.length > 50 || 
+        !/^[a-zA-Z0-9_]+$/.test(tag)
+      );
+      if (invalidTags.length > 0) {
+        errors.push('Tags must be alphanumeric strings less than 50 characters');
+      }
+    }
+  }
+  
+  return errors;
 };
 
-// Validate environment before starting
-validateEnvironment();
+const sanitizeInput = (input) => {
+  if (typeof input !== 'string') return input;
+  return validator.escape(input.trim());
+};
 
-// Authentication middleware
+// Authentication middleware with rate limiting
 const authenticateUser = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader && authHeader.split(' ')[1];
+  // Apply auth rate limiting
+  authLimiter(req, res, async (err) => {
+    if (err) return next(err);
+    
+    try {
+      const authHeader = req.headers.authorization;
+      
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ 
+          success: false,
+          error: 'Access token required in Bearer format' 
+        });
+      }
+      
+      const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+      
+      if (!token || token.length < 10) {
+        return res.status(401).json({ 
+          success: false,
+          error: 'Invalid token format' 
+        });
+      }
 
-    if (!token) {
-      return res.status(401).json({ error: 'Access token required' });
+      const { data: { user }, error } = await supabase.auth.getUser(token);
+
+      if (error || !user) {
+        return res.status(403).json({ 
+          success: false,
+          error: 'Invalid or expired token' 
+        });
+      }
+
+      req.user = user;
+      next();
+    } catch (error) {
+      console.error('Auth error:', error);
+      res.status(500).json({ 
+        success: false,
+        error: 'Authentication failed' 
+      });
     }
-
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-
-    if (error || !user) {
-      return res.status(403).json({ error: 'Invalid token' });
-    }
-
-    req.user = user;
-    next();
-  } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
-  }
+  });
 };
 
-// Helper function to get user display info from auth.users metadata
+// Helper function to get user display info
 const getUserInfo = (user) => {
   const metadata = user.user_metadata || {};
   const rawMetadata = user.raw_user_meta_data || {};
   
   return {
-    username: metadata.username || rawMetadata.username || user.email?.split('@')[0] || 'user',
-    isVerified: metadata.is_verified || rawMetadata.is_verified || false,
-    userType: metadata.user_type || rawMetadata.user_type || 'Photography Enthusiast'
+    username: sanitizeInput(
+      metadata.username || 
+      rawMetadata.username || 
+      user.email?.split('@')[0] || 
+      'user'
+    ),
+    isVerified: Boolean(metadata.is_verified || rawMetadata.is_verified),
+    userType: sanitizeInput(
+      metadata.user_type || 
+      rawMetadata.user_type || 
+      'Photography Enthusiast'
+    )
   };
 };
 
-// Helper function to upload to Cloudinary
-const uploadToCloudinary = (buffer, options = {}) => {
+// Helper function to upload to Cloudinary with security
+const uploadToCloudinary = async (buffer, options = {}) => {
   return new Promise((resolve, reject) => {
     const uploadOptions = {
-      folder: 'posts',
+      folder: 'photography_posts',
       resource_type: 'image',
+      format: 'webp', // Convert to WebP for better compression
       transformation: [
         { width: 1200, height: 1200, crop: 'limit' },
-        { quality: 'auto' },
+        { quality: 'auto:good' },
         { fetch_format: 'auto' }
       ],
+      flags: 'sanitize', // Remove potentially harmful metadata
       ...options
     };
 
     cloudinary.uploader.upload_stream(
       uploadOptions,
       (error, result) => {
-        if (error) reject(error);
-        else resolve(result);
+        if (error) {
+          console.error('Cloudinary upload error:', error);
+          reject(new Error('Image upload failed'));
+        } else {
+          resolve(result);
+        }
       }
     ).end(buffer);
   });
 };
 
-// Helper function to format post data
+// Helper function to format post data safely
 const formatPost = (post, userInfo = null) => {
   return {
     id: post.id,
@@ -134,29 +298,53 @@ const formatPost = (post, userInfo = null) => {
     imageUrl: post.image_url,
     caption: post.caption,
     location: post.location,
-    likes: post.likes || 0,
-    commentCount: post.comment_count || 0,
-    tags: post.tags || [],
+    likes: parseInt(post.likes) || 0,
+    commentCount: parseInt(post.comment_count) || 0,
+    tags: Array.isArray(post.tags) ? post.tags : [],
     createdAt: post.created_at,
-    isVerified: userInfo?.isVerified || false,
+    isVerified: Boolean(userInfo?.isVerified),
     userType: userInfo?.userType || 'Photography Enthusiast',
-    isFeatured: post.is_featured || false
+    isFeatured: Boolean(post.is_featured)
   };
 };
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
-    success: true, 
-    message: 'Post Manager API is running',
-    timestamp: new Date().toISOString()
+    success: true,
+    status: 'OK',
+    message: 'Photography API is running',
+    timestamp: new Date().toISOString(),
+    version: '2.0.0'
   });
 });
 
-// Get all posts with pagination
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    success: true,
+    status: 'OK',
+    message: 'Photography API is running',
+    timestamp: new Date().toISOString(),
+    version: '2.0.0'
+  });
+});
+
+// Get all posts with enhanced validation
 app.get('/api/posts', async (req, res) => {
   try {
-    const { limit = 10, offset = 0, sort = 'newest', user_id, tag } = req.query;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50); // Cap at 50
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const offset = (page - 1) * limit;
+    const sort = req.query.sort === 'oldest' ? 'oldest' : 'newest';
+    
+    // Validate user_id if provided
+    const userId = req.query.user_id;
+    if (userId && !validator.isUUID(userId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format'
+      });
+    }
 
     let query = supabase
       .from('posts')
@@ -168,35 +356,39 @@ app.get('/api/posts', async (req, res) => {
       `, { count: 'exact' });
 
     // Filter by user if specified
-    if (user_id) {
-      query = query.eq('user_id', user_id);
+    if (userId) {
+      query = query.eq('user_id', userId);
     }
 
     // Sort order
-    const ascending = sort === 'oldest';
-    query = query.order('created_at', { ascending });
-
+    query = query.order('created_at', { ascending: sort === 'oldest' });
+    
     // Pagination
-    query = query.range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+    query = query.range(offset, offset + limit - 1);
 
     const { data, error, count } = await query;
 
-    if (error) throw error;
+    if (error) {
+      console.error('Database error:', error);
+      throw new Error('Failed to fetch posts from database');
+    }
 
-    // Get user info for each post
+    // Get user info for each post with error handling
     const postsWithUserInfo = await Promise.all(
-      data.map(async (post) => {
+      (data || []).map(async (post) => {
         try {
-          // Get user info from auth.users
-          const { data: userData } = await supabase.auth.admin.getUserById(post.user_id);
-          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
+          const { data: userData, error: userError } = await supabase.auth.admin.getUserById(post.user_id);
           
-          // Format tags
+          if (userError) {
+            console.warn(`Failed to get user info for ${post.user_id}:`, userError);
+          }
+          
+          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
           const tags = post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
           
           return formatPost({ ...post, tags }, userInfo);
         } catch (err) {
-          console.error('Error getting user info:', err);
+          console.error('Error processing post:', err);
           return formatPost({ ...post, tags: [] });
         }
       })
@@ -204,119 +396,132 @@ app.get('/api/posts', async (req, res) => {
 
     res.json({
       success: true,
-      data: {
-        posts: postsWithUserInfo,
-        total: count,
-        limit: parseInt(limit),
-        offset: parseInt(offset)
+      posts: postsWithUserInfo,
+      pagination: {
+        total: count || 0,
+        limit,
+        page,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
   } catch (error) {
     console.error('Get posts error:', error);
-    res.status(500).json({ error: 'Failed to fetch posts' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch posts' 
+    });
   }
 });
 
-// Get post by ID
-app.get('/api/posts/:id', async (req, res) => {
+// Updated image upload endpoint to match your Flutter app
+app.post('/api/upload-images', authenticateUser, uploadLimiter, upload.array('images', 5), async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from('posts')
-      .select(`
-        *,
-        post_tags (
-          tags (name)
-        )
-      `)
-      .eq('id', id)
-      .single();
-
-    if (error) throw error;
-
-    if (!data) {
-      return res.status(404).json({ error: 'Post not found' });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No image files provided'
+      });
     }
 
-    // Get user info
-    const { data: userData } = await supabase.auth.admin.getUserById(data.user_id);
-    const userInfo = userData?.user ? getUserInfo(userData.user) : null;
-    
-    // Format tags
-    const tags = data.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
+    const uploadPromises = req.files.map(file => 
+      uploadToCloudinary(file.buffer, {
+        public_id: `post_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        tags: ['post', req.user.id]
+      })
+    );
+
+    const results = await Promise.all(uploadPromises);
+    const imageUrls = results.map(result => result.secure_url);
 
     res.json({
       success: true,
-      data: formatPost({ ...data, tags }, userInfo)
+      imageUrls,
+      message: 'Images uploaded successfully'
     });
   } catch (error) {
-    console.error('Get post error:', error);
-    res.status(500).json({ error: 'Failed to fetch post' });
+    console.error('Image upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to upload images'
+    });
   }
 });
 
-// Create new post
-app.post('/api/posts', authenticateUser, upload.single('image'), async (req, res) => {
+// Create new post - Updated to match your Flutter app structure
+app.post('/api/posts', authenticateUser, async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'Image file is required' });
-    }
+    const { content, images, tags, title, type } = req.body;
 
-    const { caption, location, tags } = req.body;
-
-    if (!caption) {
-      return res.status(400).json({ error: 'Caption is required' });
-    }
-
-    // Upload image to Cloudinary
-    const cloudinaryResult = await uploadToCloudinary(req.file.buffer, {
-      public_id: `post_${Date.now()}`,
-      tags: ['post', req.user.id]
+    // Validate input
+    const validationErrors = validatePostInput({
+      caption: content,
+      tags: tags
     });
 
-    // Parse tags if they're sent as string
-    let parsedTags = [];
-    if (tags) {
-      try {
-        parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags;
-      } catch (e) {
-        parsedTags = Array.isArray(tags) ? tags : [tags];
-      }
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: validationErrors.join('; ')
+      });
     }
+
+    if (!images || !Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one image URL is required'
+      });
+    }
+
+    // Validate image URLs
+    const invalidUrls = images.filter(url => !validator.isURL(url, { protocols: ['https'] }));
+    if (invalidUrls.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid image URLs provided'
+      });
+    }
+
+    // Sanitize inputs
+    const sanitizedContent = sanitizeInput(content);
+    const sanitizedTags = (tags || []).map(tag => sanitizeInput(tag.toLowerCase()));
 
     // Insert post
     const { data: post, error: postError } = await supabase
       .from('posts')
       .insert({
         user_id: req.user.id,
-        image_url: cloudinaryResult.secure_url,
-        caption,
-        location: location || null
+        image_url: images[0], // Use first image as primary
+        caption: sanitizedContent,
+        location: null
       })
       .select('*')
       .single();
 
-    if (postError) throw postError;
+    if (postError) {
+      console.error('Database insert error:', postError);
+      throw new Error('Failed to create post in database');
+    }
 
-    // Handle tags if any
+    // Handle tags
     const postTags = [];
-    if (parsedTags && parsedTags.length > 0) {
-      for (const tagName of parsedTags) {
-        // Create tag if it doesn't exist
-        const { data: tag, error: tagError } = await supabase
-          .from('tags')
-          .upsert({ name: tagName.toLowerCase() })
-          .select('id, name')
-          .single();
+    if (sanitizedTags.length > 0) {
+      for (const tagName of sanitizedTags) {
+        try {
+          const { data: tag, error: tagError } = await supabase
+            .from('tags')
+            .upsert({ name: tagName }, { onConflict: 'name' })
+            .select('id, name')
+            .single();
 
-        if (!tagError && tag) {
-          // Link tag to post
-          await supabase
-            .from('post_tags')
-            .insert({ post_id: post.id, tag_id: tag.id });
-          
-          postTags.push(tag.name);
+          if (!tagError && tag) {
+            await supabase
+              .from('post_tags')
+              .insert({ post_id: post.id, tag_id: tag.id });
+            
+            postTags.push(tag.name);
+          }
+        } catch (tagError) {
+          console.warn(`Failed to process tag ${tagName}:`, tagError);
         }
       }
     }
@@ -327,21 +532,46 @@ app.post('/api/posts', authenticateUser, upload.single('image'), async (req, res
     res.status(201).json({
       success: true,
       message: 'Post created successfully',
-      data: formatPost({ ...post, tags: postTags }, userInfo)
+      post: formatPost({ ...post, tags: postTags }, userInfo)
     });
   } catch (error) {
     console.error('Create post error:', error);
-    res.status(500).json({ error: 'Failed to create post' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to create post' 
+    });
   }
 });
 
-// Update post
+// Update post with validation
 app.put('/api/posts/:id', authenticateUser, async (req, res) => {
   try {
     const { id } = req.params;
-    const { caption, location, tags } = req.body;
+    
+    if (!validator.isUUID(id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid post ID format'
+      });
+    }
 
-    // Check if user owns the post
+    const { content, location, tags } = req.body;
+
+    // Validate input
+    const validationErrors = validatePostInput({
+      caption: content,
+      location,
+      tags
+    });
+
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: validationErrors.join('; ')
+      });
+    }
+
+    // Check ownership
     const { data: existingPost, error: checkError } = await supabase
       .from('posts')
       .select('user_id')
@@ -349,18 +579,26 @@ app.put('/api/posts/:id', authenticateUser, async (req, res) => {
       .single();
 
     if (checkError || !existingPost) {
-      return res.status(404).json({ error: 'Post not found' });
+      return res.status(404).json({
+        success: false,
+        error: 'Post not found'
+      });
     }
 
     if (existingPost.user_id !== req.user.id) {
-      return res.status(403).json({ error: 'Unauthorized' });
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized to modify this post'
+      });
     }
 
     // Update post
-    const updateData = {};
-    if (caption !== undefined) updateData.caption = caption;
-    if (location !== undefined) updateData.location = location || null;
-    updateData.updated_at = new Date().toISOString();
+    const updateData = {
+      updated_at: new Date().toISOString()
+    };
+    
+    if (content !== undefined) updateData.caption = sanitizeInput(content);
+    if (location !== undefined) updateData.location = location ? sanitizeInput(location) : null;
 
     const { data: updatedPost, error: updateError } = await supabase
       .from('posts')
@@ -369,61 +607,69 @@ app.put('/api/posts/:id', authenticateUser, async (req, res) => {
       .select('*')
       .single();
 
-    if (updateError) throw updateError;
+    if (updateError) {
+      console.error('Post update error:', updateError);
+      throw new Error('Failed to update post');
+    }
 
     // Update tags if provided
-    const postTags = [];
+    let postTags = [];
     if (tags !== undefined) {
       // Remove existing tags
       await supabase.from('post_tags').delete().eq('post_id', id);
 
       // Add new tags
-      const parsedTags = Array.isArray(tags) ? tags : [];
-      for (const tagName of parsedTags) {
-        const { data: tag } = await supabase
-          .from('tags')
-          .upsert({ name: tagName.toLowerCase() })
-          .select('id, name')
-          .single();
+      const sanitizedTags = tags.map(tag => sanitizeInput(tag.toLowerCase()));
+      for (const tagName of sanitizedTags) {
+        try {
+          const { data: tag } = await supabase
+            .from('tags')
+            .upsert({ name: tagName }, { onConflict: 'name' })
+            .select('id, name')
+            .single();
 
-        if (tag) {
-          await supabase
-            .from('post_tags')
-            .insert({ post_id: id, tag_id: tag.id });
-          
-          postTags.push(tag.name);
+          if (tag) {
+            await supabase
+              .from('post_tags')
+              .insert({ post_id: id, tag_id: tag.id });
+            
+            postTags.push(tag.name);
+          }
+        } catch (tagError) {
+          console.warn(`Failed to update tag ${tagName}:`, tagError);
         }
       }
-    } else {
-      // Get existing tags
-      const { data: existingTags } = await supabase
-        .from('post_tags')
-        .select('tags(name)')
-        .eq('post_id', id);
-      
-      postTags.push(...(existingTags?.map(pt => pt.tags?.name).filter(Boolean) || []));
     }
 
-    // Get user info for response
     const userInfo = getUserInfo(req.user);
 
     res.json({
       success: true,
       message: 'Post updated successfully',
-      data: formatPost({ ...updatedPost, tags: postTags }, userInfo)
+      post: formatPost({ ...updatedPost, tags: postTags }, userInfo)
     });
   } catch (error) {
     console.error('Update post error:', error);
-    res.status(500).json({ error: 'Failed to update post' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to update post' 
+    });
   }
 });
 
-// Delete post
+// Delete post with enhanced security
 app.delete('/api/posts/:id', authenticateUser, async (req, res) => {
   try {
     const { id } = req.params;
+    
+    if (!validator.isUUID(id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid post ID format'
+      });
+    }
 
-    // Check if user owns the post and get image URL
+    // Check ownership and get image URL
     const { data: post, error: checkError } = await supabase
       .from('posts')
       .select('user_id, image_url')
@@ -431,28 +677,41 @@ app.delete('/api/posts/:id', authenticateUser, async (req, res) => {
       .single();
 
     if (checkError || !post) {
-      return res.status(404).json({ error: 'Post not found' });
+      return res.status(404).json({
+        success: false,
+        error: 'Post not found'
+      });
     }
 
     if (post.user_id !== req.user.id) {
-      return res.status(403).json({ error: 'Unauthorized' });
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized to delete this post'
+      });
     }
 
-    // Delete from database (CASCADE will handle post_tags, likes, comments)
+    // Delete from database first
     const { error: deleteError } = await supabase
       .from('posts')
       .delete()
       .eq('id', id);
 
-    if (deleteError) throw deleteError;
+    if (deleteError) {
+      console.error('Post deletion error:', deleteError);
+      throw new Error('Failed to delete post from database');
+    }
 
-    // Try to delete from Cloudinary
-    try {
-      const publicId = post.image_url.split('/').pop().split('.')[0];
-      await cloudinary.uploader.destroy(`posts/${publicId}`);
-    } catch (cloudinaryError) {
-      console.error('Cloudinary deletion failed:', cloudinaryError);
-      // Continue even if Cloudinary deletion fails
+    // Try to delete from Cloudinary (non-blocking)
+    if (post.image_url && post.image_url.includes('cloudinary.com')) {
+      try {
+        const publicIdMatch = post.image_url.match(/\/([^\/]+)\.(jpg|jpeg|png|webp)$/i);
+        if (publicIdMatch) {
+          const publicId = `photography_posts/${publicIdMatch[1]}`;
+          await cloudinary.uploader.destroy(publicId);
+        }
+      } catch (cloudinaryError) {
+        console.warn('Cloudinary deletion failed (non-critical):', cloudinaryError.message);
+      }
     }
 
     res.json({
@@ -461,158 +720,38 @@ app.delete('/api/posts/:id', authenticateUser, async (req, res) => {
     });
   } catch (error) {
     console.error('Delete post error:', error);
-    res.status(500).json({ error: 'Failed to delete post' });
-  }
-});
-
-// Search posts
-app.get('/api/posts/search', async (req, res) => {
-  try {
-    const { q, limit = 10, offset = 0 } = req.query;
-
-    if (!q) {
-      return res.status(400).json({ error: 'Search query is required' });
-    }
-
-    const { data, error, count } = await supabase
-      .from('posts')
-      .select(`
-        *,
-        post_tags (
-          tags (name)
-        )
-      `, { count: 'exact' })
-      .or(`caption.ilike.%${q}%,location.ilike.%${q}%`)
-      .order('created_at', { ascending: false })
-      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
-
-    if (error) throw error;
-
-    // Get user info for each post
-    const postsWithUserInfo = await Promise.all(
-      data.map(async (post) => {
-        try {
-          const { data: userData } = await supabase.auth.admin.getUserById(post.user_id);
-          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
-          const tags = post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
-          return formatPost({ ...post, tags }, userInfo);
-        } catch (err) {
-          return formatPost({ ...post, tags: [] });
-        }
-      })
-    );
-
-    res.json({
-      success: true,
-      data: {
-        posts: postsWithUserInfo,
-        total: count,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        query: q
-      }
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to delete post' 
     });
-  } catch (error) {
-    console.error('Search error:', error);
-    res.status(500).json({ error: 'Failed to search posts' });
   }
 });
 
-// Get posts by tag
-app.get('/api/posts/tag/:tagName', async (req, res) => {
-  try {
-    const { tagName } = req.params;
-    const { limit = 10, offset = 0 } = req.query;
-
-    const { data, error, count } = await supabase
-      .from('posts')
-      .select(`
-        *,
-        post_tags!inner (
-          tags!inner (name)
-        )
-      `, { count: 'exact' })
-      .eq('post_tags.tags.name', tagName.toLowerCase())
-      .order('created_at', { ascending: false })
-      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
-
-    if (error) throw error;
-
-    // Get user info for each post
-    const postsWithUserInfo = await Promise.all(
-      data.map(async (post) => {
-        try {
-          const { data: userData } = await supabase.auth.admin.getUserById(post.user_id);
-          const userInfo = userData?.user ? getUserInfo(userData.user) : null;
-          const tags = post.post_tags?.map(pt => pt.tags?.name).filter(Boolean) || [];
-          return formatPost({ ...post, tags }, userInfo);
-        } catch (err) {
-          return formatPost({ ...post, tags: [] });
-        }
-      })
-    );
-
-    res.json({
-      success: true,
-      data: {
-        posts: postsWithUserInfo,
-        total: count,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        tag: tagName
-      }
-    });
-  } catch (error) {
-    console.error('Get posts by tag error:', error);
-    res.status(500).json({ error: 'Failed to fetch posts by tag' });
-  }
-});
-
-// Get popular tags
-app.get('/api/tags', async (req, res) => {
-  try {
-    const { limit = 20 } = req.query;
-
-    const { data, error } = await supabase
-      .rpc('get_popular_tags', { tag_limit: parseInt(limit) });
-
-    if (error) {
-      // Fallback if RPC doesn't exist
-      const { data: fallbackData, error: fallbackError } = await supabase
-        .from('tags')
-        .select(`
-          name,
-          post_tags(count)
-        `)
-        .limit(parseInt(limit));
-
-      if (fallbackError) throw fallbackError;
-
-      const tags = fallbackData.map(tag => ({
-        name: tag.name,
-        count: tag.post_tags?.length || 0
-      })).sort((a, b) => b.count - a.count);
-
-      return res.json({
-        success: true,
-        data: tags
-      });
-    }
-
-    res.json({
-      success: true,
-      data: data || []
-    });
-  } catch (error) {
-    console.error('Get tags error:', error);
-    res.status(500).json({ error: 'Failed to fetch tags' });
-  }
-});
-
-// Like/Unlike post
+// Like/Unlike post with validation
 app.post('/api/posts/:id/like', authenticateUser, async (req, res) => {
   try {
     const { id } = req.params;
+    
+    if (!validator.isUUID(id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid post ID format'
+      });
+    }
+
+    // Check if post exists
+    const { data: postExists } = await supabase
+      .from('posts')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (!postExists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Post not found'
+      });
+    }
 
     // Check if already liked
     const { data: existingLike } = await supabase
@@ -646,7 +785,16 @@ app.post('/api/posts/:id/like', authenticateUser, async (req, res) => {
           user_id: req.user.id
         });
 
-      if (error) throw error;
+      if (error) {
+        if (error.code === '23505') { // Unique constraint violation
+          return res.json({
+            success: true,
+            message: 'Post already liked',
+            liked: true
+          });
+        }
+        throw error;
+      }
 
       res.json({
         success: true,
@@ -656,30 +804,73 @@ app.post('/api/posts/:id/like', authenticateUser, async (req, res) => {
     }
   } catch (error) {
     console.error('Like/unlike error:', error);
-    res.status(500).json({ error: 'Failed to like/unlike post' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to process like action' 
+    });
   }
 });
 
-// Error handling middleware
+// Enhanced error handling middleware
 app.use((error, req, res, next) => {
   console.error('Global error:', error);
 
   if (error.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ error: 'File too large. Maximum size is 5MB.' });
+    return res.status(400).json({ 
+      success: false,
+      error: 'File too large. Maximum size is 5MB.' 
+    });
   }
 
-  res.status(500).json({ error: 'Internal server error' });
+  if (error.code === 'LIMIT_UNEXPECTED_FILE') {
+    return res.status(400).json({ 
+      success: false,
+      error: 'Unexpected file field.' 
+    });
+  }
+
+  if (error.type === 'entity.too.large') {
+    return res.status(413).json({ 
+      success: false,
+      error: 'Request entity too large.' 
+    });
+  }
+
+  // Don't expose internal errors in production
+  const message = process.env.NODE_ENV === 'production' 
+    ? 'Internal server error' 
+    : error.message;
+
+  res.status(500).json({ 
+    success: false,
+    error: message 
+  });
 });
 
 // 404 handler
 app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Route not found' });
+  res.status(404).json({ 
+    success: false,
+    error: 'Route not found' 
+  });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  process.exit(0);
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Post Manager API running on port ${PORT}`);
+  console.log(`🚀 Photography API running on port ${PORT}`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔒 Security features enabled`);
 });
 
 module.exports = app;
